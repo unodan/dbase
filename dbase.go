@@ -15,12 +15,13 @@ import (
 	"unicode"
 
 	_ "github.com/go-sql-driver/mysql"
+
 	"github.com/unodan/cache"
 )
 
 var cStore *cache.Store
 
-type Data struct {
+type Cache struct {
 	Driver     string
 	User       string
 	UserPass   string
@@ -30,7 +31,7 @@ type Data struct {
 	ServerIP   string
 	ServerName string
 	ServerPort string
-	Connection *sql.DB
+	DBHandle   *sql.DB
 }
 
 func inList(a string, list *[]string) bool {
@@ -42,52 +43,42 @@ func inList(a string, list *[]string) bool {
 	return false
 }
 
-func Server(d *Data) (*cache.Store, error) {
+func Server(c *Cache) (*cache.Store, error) {
 	var (
 		err    error
-		con    *sql.DB
-		cs     = cStore.New()
+		hdl    *sql.DB
 		sqlcmd string
+
+		ca        = cStore.New()
+		cacheData = Cache{
+			Driver:     "mysql",
+			ServerIP:   "127.0.0.1",
+			ServerName: "localhost",
+			ServerPort: "3306",
+		}
 	)
-	data := Data{
-		Driver:     "mysql",
-		ServerIP:   "127.0.0.1",
-		ServerName: "localhost",
-		ServerPort: "3306",
-	}
 
-	dflt := reflect.Indirect(reflect.ValueOf(&data))
-	if d != nil {
-		vData := reflect.Indirect(reflect.ValueOf(d))
-
+	dflt := reflect.Indirect(reflect.ValueOf(&cacheData))
+	if c != nil {
+		vCache := reflect.Indirect(reflect.ValueOf(c))
 		for i := 0; i < dflt.NumField(); i++ {
-			switch fmt.Sprintf("%s", vData.Field(i).Type().Name()) {
-			case "string":
-				if vData.Field(i).Interface().(string) == "" {
-					cs.Set(dflt.Type().Field(i).Name, dflt.Field(i).Interface().(string))
-				} else {
-					cs.Set(vData.Type().Field(i).Name, vData.Field(i).Interface().(string))
-				}
-				break
-			case "*sql.DB":
-				if vData.Field(i).Interface().(*sql.DB) == nil {
-					cs.Set(dflt.Type().Field(i).Name, dflt.Field(i).Interface().(*sql.DB))
-				} else {
-					cs.Set(vData.Type().Field(i).Name, vData.Field(i).Interface().(*sql.DB))
-				}
+			if vCache.Field(i).Interface() == nil || vCache.Field(i).Interface() == "" {
+				ca.Set(dflt.Type().Field(i).Name, dflt.Field(i).Interface())
+			} else {
+				ca.Set(vCache.Type().Field(i).Name, vCache.Field(i).Interface())
 			}
 		}
 
 		var (
-			user       = cs.Get("User").(string)
-			userPass   = cs.Get("UserPass").(string)
-			projectID  = cs.Get("ProjectID").(string)
-			instanceID = cs.Get("InstanceID").(string)
-			driver     = cs.Get("Driver").(string)
-			database   = cs.Get("Database").(string)
-			serverIP   = cs.Get("ServerIP").(string)
-			serverName = cs.Get("ServerName").(string)
-			serverPort = cs.Get("ServerPort").(string)
+			user       = ca.Get("User").(string)
+			userPass   = ca.Get("UserPass").(string)
+			projectID  = ca.Get("ProjectID").(string)
+			instanceID = ca.Get("InstanceID").(string)
+			driver     = ca.Get("Driver").(string)
+			database   = ca.Get("Database").(string)
+			serverIP   = ca.Get("ServerIP").(string)
+			serverName = ca.Get("ServerName").(string)
+			serverPort = ca.Get("ServerPort").(string)
 		)
 
 		if serverName == "localhost" || serverIP == "127.0.0.1" {
@@ -95,16 +86,16 @@ func Server(d *Data) (*cache.Store, error) {
 		} else {
 			sqlcmd = user + "@cloudsql(" + projectID + ":" + instanceID + ")/" + database
 		}
-		con, err = sql.Open(driver, sqlcmd)
+		hdl, err = sql.Open(driver, sqlcmd)
 
 		if err != nil {
 			log.Println("dbase, Error: could not connect to database server [ " + serverIP + " ] as user [ " + user + " ] ")
 		} else {
-			results, err := con.Query("SELECT CURRENT_USER()")
+			results, err := hdl.Query("SELECT CURRENT_USER()")
 			defer results.Close()
 
 			if err == nil {
-				cs.Set("Connection", con)
+				ca.Set("DBHandle", hdl)
 				current_user := ""
 				for results.Next() {
 					results.Scan(&current_user)
@@ -114,9 +105,9 @@ func Server(d *Data) (*cache.Store, error) {
 			}
 		}
 	}
-	return cs, err
+	return ca, err
 }
-func GetFieldNames(con *sql.DB, database string, table string) []string {
+func GetFieldNames(hdl *sql.DB, database string, table string) []string {
 	var (
 		err    error
 		name   string
@@ -125,7 +116,8 @@ func GetFieldNames(con *sql.DB, database string, table string) []string {
 		stmt   *sql.Stmt
 		sqlcmd = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=?"
 	)
-	if stmt, err = con.Prepare(sqlcmd); err == nil {
+
+	if stmt, err = hdl.Prepare(sqlcmd); err == nil {
 		if rows, err = stmt.Query(database, table); err != nil {
 			log.Println("dbase,", err)
 		} else {
@@ -135,17 +127,18 @@ func GetFieldNames(con *sql.DB, database string, table string) []string {
 				names = append(names, name)
 			}
 		}
+		Use(hdl, database)
+		stmt.Close()
 	} else {
-		log.Println(err)
+		log.Println("dbase,", err)
 	}
-	stmt.Close()
 
 	return names
 }
-func GetDatabaseName(con *sql.DB) string {
+func GetDatabaseName(hdl *sql.DB) string {
 	var dbName string
 
-	rows, err := con.Query("SELECT DATABASE()")
+	rows, err := hdl.Query("SELECT DATABASE()")
 	defer rows.Close()
 
 	if err != nil {
@@ -157,12 +150,12 @@ func GetDatabaseName(con *sql.DB) string {
 	}
 	return dbName
 }
-func GetDatabaseNamesList(con *sql.DB) *[]string {
+func GetDatabaseNamesList(hdl *sql.DB) *[]string {
 	var (
 		dbName  string
 		dbNames []string
 	)
-	rows, err := con.Query("SHOW DATABASES;")
+	rows, err := hdl.Query("SHOW DATABASES;")
 	defer rows.Close()
 
 	if err != nil {
@@ -191,11 +184,11 @@ func SanatizeWhiteSpace(in string) (out string) {
 	return
 }
 
-func Use(con *sql.DB, name string) bool {
+func Use(hdl *sql.DB, name string) bool {
 	var result = true
 
-	if GetDatabaseName(con) != name {
-		if _, err := con.Exec("USE " + name); err == nil {
+	if GetDatabaseName(hdl) != name {
+		if _, err := hdl.Exec("USE " + name); err == nil {
 			log.Println("dbase, Info: USE [ " + name + " ]")
 		} else {
 			result = false
@@ -205,22 +198,31 @@ func Use(con *sql.DB, name string) bool {
 	}
 	return result
 }
-func Exec(con *sql.DB, sqlcmd string, args ...interface{}) (sql.Result, error) {
+func Exec(hdl *sql.DB, sqlcmd string, args ...interface{}) (sql.Result, error) {
 	var (
 		err  error
 		stmt *sql.Stmt
 		res  sql.Result
 	)
-	if stmt, err = con.Prepare(sqlcmd); err == nil {
+	if stmt, err = hdl.Prepare(sqlcmd); err == nil {
 		res, err = stmt.Exec(args...)
 	}
 	return res, err
 }
-func Query(con *sql.DB, sqlcmd string, args ...interface{}) (*sql.Rows, error) {
-	return con.Query(sqlcmd, args...)
+func Query(hdl *sql.DB, sqlcmd string, args ...interface{}) (*sql.Rows, error) {
+	return hdl.Query(sqlcmd, args...)
 }
 
-func InsertRow(con *sql.DB, table string, d interface{}) (int64, error) {
+func RowExist(hdl *sql.DB, table string, id int64) bool {
+	result := false
+
+	rows, err := Query(hdl, "SELECT id FROM "+table+" WHERE id=?", id)
+	if err == nil && rows.Next() {
+		result = true
+	}
+	return result
+}
+func InsertRow(hdl *sql.DB, table string, d interface{}) (int64, error) {
 	var (
 		id   int64
 		err  error
@@ -243,7 +245,7 @@ func InsertRow(con *sql.DB, table string, d interface{}) (int64, error) {
 		}
 		sqlcmd += strings.ToLower(sqlcmd1[:len(sqlcmd1)-1]) + ") VALUES(" + sqlcmd2[:len(sqlcmd2)-1] + ") "
 
-		if stmt, err = con.Prepare(sqlcmd); err == nil {
+		if stmt, err = hdl.Prepare(sqlcmd); err == nil {
 			log.Println("dbase, Info:", sqlcmd)
 			if r, e := stmt.Exec(columns...); e == nil {
 				if id, err = r.LastInsertId(); err == nil {
@@ -259,7 +261,7 @@ func InsertRow(con *sql.DB, table string, d interface{}) (int64, error) {
 	}
 	return id, err
 }
-func UpdateRow(con *sql.DB, table string, id int64, d *map[string]interface{}) error {
+func UpdateRow(hdl *sql.DB, table string, id int64, d *map[string]interface{}) error {
 	var (
 		err     error
 		sqlcmd  string
@@ -279,7 +281,7 @@ func UpdateRow(con *sql.DB, table string, id int64, d *map[string]interface{}) e
 		columns[cnt] = id
 		sqlcmd = sqlcmd[:len(sqlcmd)-1] + " WHERE id=?"
 
-		if stmt, err = con.Prepare(sqlcmd); err == nil {
+		if stmt, err = hdl.Prepare(sqlcmd); err == nil {
 			log.Println("dbase, Info:", sqlcmd)
 			if _, err = stmt.Exec(columns...); err == nil {
 				str := ""
@@ -299,8 +301,8 @@ func UpdateRow(con *sql.DB, table string, id int64, d *map[string]interface{}) e
 	}
 	return err
 }
-func DeleteRow(con *sql.DB, table string, id int64) (int64, error) {
-	res, err := con.Exec(fmt.Sprintf("DELETE FROM %s WHERE id=%d;", table, id))
+func DeleteRow(hdl *sql.DB, table string, id int64) (int64, error) {
+	res, err := hdl.Exec(fmt.Sprintf("DELETE FROM %s WHERE id=%d;", table, id))
 
 	if err != nil {
 		log.Printf("dbase, Error: Could not delete row id=%d\n%s", id, err)
@@ -311,22 +313,22 @@ func DeleteRow(con *sql.DB, table string, id int64) (int64, error) {
 	return rows, err
 }
 
-func Exist(con *sql.DB, name string) bool {
-	return inList(name, GetDatabaseNamesList(con))
+func Exist(hdl *sql.DB, name string) bool {
+	return inList(name, GetDatabaseNamesList(hdl))
 }
-func TableExist(con *sql.DB, name string) bool {
+func TableExist(hdl *sql.DB, name string) bool {
 	result := false
-	if _, err := con.Exec("SELECT 1 FROM " + name + " LIMIT 1;"); err == nil {
+	if _, err := hdl.Exec("SELECT 1 FROM " + name + " LIMIT 1;"); err == nil {
 		result = true
 	}
 	return result
 }
-func CreateTable(con *sql.DB, name string, sqlcmd string) bool {
+func CreateTable(hdl *sql.DB, name string, sqlcmd string) bool {
 	var success = true
 	sqlcmd = SanatizeWhiteSpace(sqlcmd)
 
-	if !TableExist(con, name) {
-		_, err := con.Exec("CREATE TABLE " + name + " ( " + sqlcmd + " )")
+	if !TableExist(hdl, name) {
+		_, err := hdl.Exec("CREATE TABLE " + name + " ( " + sqlcmd + " )")
 		if err == nil {
 			log.Println("dbase, Info: CREATE TABLE [ " + name + " ]")
 		} else {
@@ -336,9 +338,9 @@ func CreateTable(con *sql.DB, name string, sqlcmd string) bool {
 	}
 	return success
 }
-func CreateDatabase(con *sql.DB, name string) bool {
+func CreateDatabase(hdl *sql.DB, name string) bool {
 	var success = true
-	_, err := con.Exec("CREATE DATABASE " + name)
+	_, err := hdl.Exec("CREATE DATABASE " + name)
 	if err == nil {
 		log.Println("dbase, Info: CREATE DATABASE [ " + name + " ]")
 	} else {
